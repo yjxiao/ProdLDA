@@ -14,7 +14,7 @@ class Encoder(nn.Module):
     def forward(self, inputs):
         h1 = F.softplus(self.fc1(inputs))
         h2 = F.softplus(self.fc2(h1))
-        return self.drop1(h2)
+        return self.drop(h2)
 
 
 class HiddenToLogNormal(nn.Module):
@@ -57,25 +57,23 @@ class Decoder(nn.Module):
 
 
 class ProdLDA(nn.Module):
-    def __init__(self, vocab_size, hidden_size, num_topics, dropout):
+    def __init__(self, vocab_size, hidden_size, num_topics,
+                 dropout, use_lognormal=False):
         super().__init__()
-        self.drop1 = nn.Dropout(dropout)
-        # encoder hidden layers
-        # for latent code
-        # decoder 
-        self.fc3 = nn.Linear(num_topics, vocab_size)
-        self.bn  = nn.BatchNorm1d(vocab_size)
-        self.drop2 = nn.Dropout(dropout)
-        
-    def reparameterize(self, mu, logvar):
-        std = logvar.mul(0.5).exp_()
-        eps = std.new(std.size()).normal_()
-        return eps.mul(std).add_(mu)
+        self.encode = Encoder(vocab_size, hidden_size, dropout)
+        if use_lognormal:
+            self.h2t = HiddenToLogNormal(hidden_size, num_topics)
+        else:
+            self.h2t = HiddenToDirichlet(hidden_size, num_topics)
+        self.decode = Decoder(vocab_size, num_topics, dropout)
     
     def forward(self, inputs):
-        mu = self.bnmu(self.fcmu(h))
-        lv = self.bnlv(self.fclv(h))
-        z = self.reparameterize(mu, lv)
-        p = self.drop2(F.softmax(z, dim=1))
-        outputs = F.softmax(self.bn(self.fc3(p)), dim=1)
-        return outputs, mu, lv
+        h = self.encode(inputs)
+        posterior = self.h2t(h)
+        if self.training:
+            t = posterior.rsample().to(inputs.device)
+        else:
+            t = posterior.mean.to(inputs.device)
+        t = t / t.sum(1, keepdim=True)
+        outputs = self.decode(t)
+        return outputs, posterior

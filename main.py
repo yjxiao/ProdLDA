@@ -3,6 +3,8 @@ import time
 import math
 import torch
 import torch.nn.functional as F
+from torch.distributions import LogNormal, Dirichlet
+from torch.distributions import kl_divergence
 
 from model import ProdLDA
 import data
@@ -16,6 +18,8 @@ parser.add_argument('--dropout', type=float, default=0.2,
                     help="dropout applied to layers (0 = no dropout)")
 parser.add_argument('--data', type=str, default='./data/20news',
                     help="location of the data folder")
+parser.add_argument('--use_lognormal', action='store_true',
+                    help="Use LogNormal to approximate Dirichlet")
 parser.add_argument('--epochs', type=int, default=48,
                     help="maximum training epochs")
 parser.add_argument('--batch_size', type=int, default=32, metavar='N',
@@ -35,16 +39,29 @@ args = parser.parse_args()
 torch.manual_seed(args.seed)
 
 
-def loss_function(inputs, outputs, mu, logvar):
-    nll = - (inputs.clone() * (outputs + 1e-10).log()).sum()
-    kld = 0.5 * torch.sum(logvar.exp() + mu.pow(2) - logvar - 1)
-    return nll, kld
+def recon_loss(targets, outputs):
+    nll = - torch.sum(targets * outputs)
+    return nll
+
+
+def standard_prior_like(posterior):
+    if isinstance(posterior, LogNormal):
+        loc = torch.zeros_like(posterior.loc)
+        scale = torch.ones_like(posterior.scale)        
+        prior = LogNormal(loc, scale)
+    elif isinstance(posterior, Dirichlet):
+        alphas = torch.ones_like(posterior.concentration)
+        prior = Dirichlet(alphas)
+    return prior
 
 
 def get_loss(inputs, model, device):
     inputs = inputs.to(device)
-    outputs, mu, logvar = model(inputs)
-    return loss_function(inputs, outputs, mu, logvar)
+    outputs, posterior = model(inputs)
+    prior = standard_prior_like(posterior)
+    nll = recon_loss(inputs, outputs)
+    kld = torch.sum(kl_divergence(posterior, prior).to(device))
+    return nll, kld
 
 
 def evaluate(data_source, model, device):
@@ -52,15 +69,16 @@ def evaluate(data_source, model, device):
     total_nll = 0.0
     total_kld = 0.0
     total_words = 0
+    size = data_source.size
     for i in range(0, data_source.size, args.batch_size):
         batch_size = min(data_source.size-i, args.batch_size)
         data = data_source.get_batch(batch_size, i)
         nll, kld = get_loss(data, model, device)
-        total_nll += nll.item()
-        total_kld += kld.item()
+        total_nll += nll.item() / size
+        total_kld += kld.item() / size
         total_words += data.sum()
-    ppl = math.exp(total_nll / total_words)
-    return (total_nll / data_source.size, total_kld / data_source.size, ppl)
+    ppl = math.exp(total_nll * size / total_words)
+    return (total_nll, total_kld, ppl)
 
 
 def train(data_source, model, optimizer, epoch, device):
@@ -68,19 +86,19 @@ def train(data_source, model, optimizer, epoch, device):
     total_nll = 0.0
     total_kld = 0.0
     total_words = 0
+    size = args.epoch_size * args.batch_size
     for i in range(args.epoch_size):
         data = data_source.get_batch(args.batch_size)
         nll, kld = get_loss(data, model, device)
-        total_nll += nll.item()
-        total_kld += kld.item()
+        total_nll += nll.item() / size
+        total_kld += kld.item() / size
         total_words += data.sum()
         optimizer.zero_grad()
         loss = nll + kld
         loss.backward()
         optimizer.step()
-    ppl = math.exp(total_nll / total_words)
-    num_samples = args.epoch_size * args.batch_size
-    return (total_nll / num_samples, total_kld / num_samples, ppl)
+    ppl = math.exp(total_nll * size / total_words)
+    return (total_nll, total_kld, ppl)
 
 
 def get_savepath(args):
@@ -110,7 +128,9 @@ def main(args):
     print("Constructing model")
     print(args)
     device = torch.device('cpu' if args.nocuda else 'cuda')
-    model = ProdLDA(vocab_size, args.hidden_size, args.num_topics, args.dropout).to(device)
+    model = ProdLDA(
+        vocab_size, args.hidden_size, args.num_topics,
+        args.dropout, args.use_lognormal).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
     best_loss = None
 
@@ -147,7 +167,7 @@ def main(args):
           "| test ppl {:5.2f}".format(
               test_nll, test_kld, test_ppl))
     print('=' * 80)
-    emb = model.fc3.weight.cpu().detach().numpy().T
+    emb = model.decode.fc.weight.cpu().detach().numpy().T
     idx2word = dict((i, w) for (w, i) in corpus.vocab.items())
     print_top_words(emb, idx2word)
 
